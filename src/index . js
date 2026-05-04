@@ -1,0 +1,102 @@
+require("dotenv").config();
+const express = require("express");
+const tradovate = require("./tradovate");
+const { evaluateSignal } = require("./claude");
+const risk = require("./riskManager");
+
+const app = express();
+app.use(express.json());
+
+const PORT = process.env.PORT || 3000;
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
+
+function log(msg) {
+  console.log(`[${new Date().toISOString()}] ${msg}`);
+}
+
+app.get("/", (req, res) => {
+  res.json({
+    status: "🟢 FVG Trading Bot is running",
+    env: process.env.TRADOVATE_ENV || "demo",
+    risk: risk.getStatus(),
+  });
+});
+
+app.get("/status", async (req, res) => {
+  try {
+    const balance = await tradovate.getCashBalance();
+    const positions = await tradovate.getPositions();
+    res.json({ balance, positions, risk: risk.getStatus() });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/kill", async (req, res) => {
+  const { secret } = req.body;
+  if (secret !== WEBHOOK_SECRET) return res.status(401).json({ error: "Unauthorized" });
+  risk.killSwitch();
+  try {
+    await tradovate.flattenAll();
+    res.json({ status: "Kill switch activated" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/webhook", async (req, res) => {
+  const signal = req.body;
+  log(`📡 Webhook received: ${JSON.stringify(signal)}`);
+
+  if (WEBHOOK_SECRET && signal.secret !== WEBHOOK_SECRET) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  const required = ["symbol", "direction", "fvgTop", "fvgBottom", "ce", "stopLoss", "takeProfit"];
+  const missing = required.filter((f) => signal[f] === undefined);
+  if (missing.length > 0) {
+    return res.status(400).json({ error: `Missing: ${missing.join(", ")}` });
+  }
+
+  try {
+    const balance = await tradovate.getCashBalance();
+    risk.setStartBalance(balance.cashBalance);
+
+    const riskCheck = risk.canTrade(balance.cashBalance);
+    if (!riskCheck.ok) {
+      return res.json({ status: "SKIPPED", reason: riskCheck.reason });
+    }
+
+    const decision = await evaluateSignal(signal, balance);
+
+    if (decision.decision !== "TRADE") {
+      return res.json({ status: "SKIPPED", decision });
+    }
+
+    const contracts = Math.min(decision.contracts || 1, risk.getMaxContracts());
+    const order = await tradovate.placeOrder({
+      symbol: signal.symbol,
+      action: decision.action,
+      contracts,
+      stopLoss: signal.stopLoss,
+      takeProfit: signal.takeProfit,
+    });
+
+    risk.recordTrade();
+    return res.json({ status: "EXECUTED", decision, order });
+
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.listen(PORT, async () => {
+  log(`🚀 Bot started on port ${PORT}`);
+  try {
+    await tradovate.authenticate();
+    const balance = await tradovate.getCashBalance();
+    log(`💰 ${balance.accountName} | $${balance.cashBalance}`);
+  } catch (err) {
+    log(`⚠️ Tradovate: ${err.message}`);
+  }
+});
